@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -20,7 +22,9 @@ class TauTask:
 
 
 class Tau3BenchAdapter:
+    _ADAPTER_VERSION = "0.1.0"
     _DEFAULT_SPLIT = "base"
+    _EXPECTED_TAU2_COMMIT = "1d244f5dca42944b67a379b44bfeb9f5748f189d"
     _TAU2_BENCH_REPO_URL = "https://github.com/sierra-research/tau2-bench.git"
     _DEFAULT_DOMAINS: tuple[str, ...] = (
         "airline",
@@ -30,6 +34,7 @@ class Tau3BenchAdapter:
     )
     _TEMPLATE_DIR = Path(__file__).parent / "task-template"
     _BANKING_PROMPT_COMPONENT_PATTERN = re.compile(r"\{\{component:(\w+)\}\}")
+    _IMMUTABLE_IMAGE_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
 
     _DOMAIN_CONFIG: dict[str, dict[str, Any]] = {
         "airline": {
@@ -64,16 +69,65 @@ class Tau3BenchAdapter:
         limit: int | None = None,
         overwrite: bool = False,
         task_ids: list[str] | None = None,
+        main_image: str | None = None,
+        runtime_image: str | None = None,
         **kwargs,
     ):
         self.output_dir = output_dir
         self.limit = limit
         self.overwrite = overwrite
         self.task_ids = task_ids
+        self.main_image = self._validate_image("main_image", main_image)
+        self.runtime_image = self._validate_image("runtime_image", runtime_image)
         self.split_name = str(kwargs.get("split_name", self._DEFAULT_SPLIT))
         self.domains = self._parse_domains(kwargs.get("domains"))
         self.tau2_root = self._resolve_tau2_root(kwargs.get("tau2_root"))
         self._policy_cache: dict[str, str] = {}
+
+    def _validate_image(self, name: str, image: str | None) -> str:
+        if image is None or self._IMMUTABLE_IMAGE_PATTERN.fullmatch(image) is None:
+            raise ValueError(f"{name} must be an immutable sha256 image ID")
+        return image
+
+    def _resolve_tau2_commit(self) -> str:
+        commit = subprocess.run(
+            ["git", "-C", str(self.tau2_root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if commit != self._EXPECTED_TAU2_COMMIT:
+            raise ValueError(
+                "tau2-bench source must be pinned to "
+                f"{self._EXPECTED_TAU2_COMMIT}; found {commit}"
+            )
+        # Limit cleanliness checks to benchmark inputs. Local credentials,
+        # simulation results, documentation, and ignored caches are unrelated.
+        dirty_inputs = subprocess.run(
+            [
+                "git",
+                "--no-optional-locks",
+                "-C",
+                str(self.tau2_root),
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+                "--",
+                "data/tau2/domains",
+                "src/tau2",
+                "pyproject.toml",
+                "uv.lock",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if dirty_inputs:
+            raise ValueError(
+                "tau2-bench source has uncommitted benchmark input changes:\n"
+                f"{dirty_inputs}"
+            )
+        return commit
 
     def _is_tau2_root(self, path: Path) -> bool:
         return (path / "data" / "tau2" / "domains").is_dir()
@@ -136,33 +190,56 @@ class Tau3BenchAdapter:
             )
 
         destination.parent.mkdir(parents=True, exist_ok=True)
-        command = [
-            "git",
-            "clone",
-            "--depth",
-            "1",
-            self._TAU2_BENCH_REPO_URL,
-            str(destination),
+        # Reserve the new checkout before running Git so failure cleanup cannot
+        # remove a preexisting caller-owned directory.
+        destination.mkdir()
+        commands = [
+            ["git", "init", "--quiet", str(destination)],
+            [
+                "git",
+                "-C",
+                str(destination),
+                "remote",
+                "add",
+                "origin",
+                self._TAU2_BENCH_REPO_URL,
+            ],
+            [
+                "git",
+                "-C",
+                str(destination),
+                "fetch",
+                "--depth",
+                "1",
+                "origin",
+                self._EXPECTED_TAU2_COMMIT,
+            ],
+            ["git", "-C", str(destination), "checkout", "--detach", "FETCH_HEAD"],
         ]
         try:
-            subprocess.run(command, check=True)
+            for command in commands:
+                subprocess.run(command, check=True)
         except FileNotFoundError as exc:
+            shutil.rmtree(destination)
             raise RuntimeError(
                 "Could not locate tau2-bench root and `git` is not available to "
                 f"clone {self._TAU2_BENCH_REPO_URL}."
             ) from exc
         except subprocess.CalledProcessError as exc:
+            shutil.rmtree(destination)
             checked = ""
             if checked_paths:
                 checked = "\nChecked:\n" + "\n".join(
                     f"- {candidate}" for candidate in checked_paths
                 )
             raise RuntimeError(
-                "Could not locate tau2-bench root and failed to clone "
+                "Could not locate tau2-bench root and failed to fetch pinned "
+                f"commit {self._EXPECTED_TAU2_COMMIT} from "
                 f"{self._TAU2_BENCH_REPO_URL} to {destination}.{checked}"
             ) from exc
 
         if not self._is_tau2_root(destination):
+            shutil.rmtree(destination)
             raise RuntimeError(
                 "Cloned tau2-bench repository does not contain the expected "
                 f"`data/tau2/domains` directory: {destination}"
@@ -311,7 +388,8 @@ class Tau3BenchAdapter:
         if not self.task_ids:
             return tasks
 
-        requested = {task_id.strip() for task_id in self.task_ids if task_id}
+        requested = {task_id.strip() for task_id in self.task_ids}
+        matched: set[str] = set()
         filtered: list[TauTask] = []
         for task in tasks:
             aliases = {
@@ -320,13 +398,21 @@ class Tau3BenchAdapter:
                 f"{task.domain}:{task.source_id}",
                 f"{task.domain}/{task.source_id}",
             }
-            if aliases.intersection(requested):
+            matching_aliases = aliases.intersection(requested)
+            if matching_aliases:
+                matched.update(matching_aliases)
                 filtered.append(task)
+        unmatched = requested - matched
+        if unmatched:
+            raise ValueError(
+                "Unknown task IDs: "
+                + ", ".join(repr(task_id) for task_id in sorted(unmatched))
+            )
         return filtered
 
     def _copy_template(self, output_dir: Path) -> None:
         for item in self._TEMPLATE_DIR.iterdir():
-            if item.name in {".DS_Store", "__pycache__"}:
+            if item.name in {".DS_Store", "__pycache__", "solution"}:
                 continue
             destination = output_dir / item.name
             if item.is_dir():
@@ -383,27 +469,8 @@ class Tau3BenchAdapter:
         task = task.replace("{task_id}", task_id)
         task = task.replace("{difficulty}", "medium")
         task = task.replace("{domain}", tau_task.domain)
+        task = task.replace("{main_image}", self.main_image)
         (task_dir / "task.toml").write_text(task, encoding="utf-8")
-
-    def _write_solution(
-        self, task_dir: Path, tau_task: TauTask, test_config: dict[str, Any]
-    ) -> None:
-        solution = self._read_template("solution/solve.sh")
-        task = tau_task.task
-        initial_state = task.get("initial_state") or {}
-        oracle_answer = {
-            "actions": test_config["expected_actions"],
-            "communicate_info": test_config["expected_communicate_info"],
-            "initialization_data": initial_state.get("initialization_data"),
-            "initialization_actions": initial_state.get("initialization_actions") or [],
-        }
-        oracle_json = json.dumps(oracle_answer, indent=2, ensure_ascii=True)
-        solution = solution.replace("{oracle}", oracle_json)
-        solution = solution.replace("{domain}", tau_task.domain)
-        solution = solution.replace("{task_id}", str(tau_task.task.get("id", "")))
-        solve_path = task_dir / "solution" / "solve.sh"
-        solve_path.write_text(solution, encoding="utf-8")
-        solve_path.chmod(0o755)
 
     def _write_runtime_assets(
         self, task_dir: Path, test_config: dict[str, Any]
@@ -416,35 +483,129 @@ class Tau3BenchAdapter:
 
     def _write_test_assets(self, task_dir: Path, test_config: dict[str, Any]) -> None:
         tests_dir = task_dir / "tests"
-        (tests_dir / "config.json").write_text(
-            json.dumps(test_config, indent=2, ensure_ascii=True), encoding="utf-8"
-        )
         self._write_runtime_assets(task_dir, test_config)
         (tests_dir / "test.sh").chmod(0o755)
         (tests_dir / "evaluate.py").chmod(0o755)
 
-    def _write_task(self, tau_task: TauTask) -> None:
+    def _write_compose(self, task_dir: Path) -> None:
+        compose_path = task_dir / "environment" / "docker-compose.yaml"
+        compose = compose_path.read_text(encoding="utf-8")
+        compose = compose.replace("{main_image}", self.main_image)
+        compose = compose.replace("{runtime_image}", self.runtime_image)
+        compose_path.write_text(compose, encoding="utf-8")
+
+    def _prepare_output_dir(self) -> None:
+        if not self.output_dir.exists():
+            self.output_dir.mkdir(parents=True)
+            return
+
+        existing = list(self.output_dir.iterdir())
+        if existing and not self.overwrite:
+            raise FileExistsError(
+                f"Output directory is not empty: {self.output_dir}. "
+                "Use overwrite=True to replace the generated dataset."
+            )
+
+        manifest_names = {
+            "tau3-adapter-manifest.json",
+            ".tau3-adapter-manifest.json.tmp",
+        }
+        task_dirs: list[Path] = []
+        manifest_paths: list[Path] = []
+        for path in existing:
+            if path.name in manifest_names and path.is_file() and not path.is_symlink():
+                manifest_paths.append(path)
+            elif self._is_generated_task_dir(path):
+                task_dirs.append(path)
+            else:
+                raise ValueError(
+                    f"Refusing to overwrite unrecognized output entry: {path}. "
+                    "Use a dedicated generated-dataset directory."
+                )
+
+        # Preflight every entry before deleting any generated task or manifest.
+        for path in task_dirs:
+            shutil.rmtree(path)
+        for path in manifest_paths:
+            path.unlink()
+
+    def _is_generated_task_dir(self, path: Path) -> bool:
+        if not path.is_dir() or path.is_symlink() or not path.name.startswith("tau3-"):
+            return False
+        required_assets = (
+            "instruction.md",
+            "environment/Dockerfile",
+            "environment/docker-compose.yaml",
+            "environment/runtime-server/task_config.json",
+            "tests/test.sh",
+            "tests/evaluate.py",
+        )
+        if not all((path / asset).is_file() for asset in required_assets):
+            return False
+        try:
+            config = tomllib.loads((path / "task.toml").read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+            return False
+        task = config.get("task")
+        return isinstance(task, dict) and task.get("name") == (
+            f"sierra-research/tau3-bench__{path.name}"
+        )
+
+    def _write_task(self, tau_task: TauTask, test_config: dict[str, Any]) -> None:
         task_dir = self.output_dir / tau_task.local_task_id
         if task_dir.exists():
-            if not self.overwrite:
-                return
-            shutil.rmtree(task_dir)
+            raise FileExistsError(f"Task output already exists: {task_dir}")
 
         task_dir.mkdir(parents=True, exist_ok=True)
         self._copy_template(task_dir)
 
-        test_config = self._build_test_config(tau_task)
+        self._write_compose(task_dir)
         self._write_instruction(task_dir, tau_task)
         self._write_task_toml(task_dir, tau_task)
-        self._write_solution(task_dir, tau_task, test_config)
         self._write_test_assets(task_dir, test_config)
 
+    def _write_manifest(
+        self,
+        tau2_commit: str,
+        task_payload_sha256: dict[str, str],
+    ) -> None:
+        manifest = {
+            "schema_version": 1,
+            "adapter_version": self._ADAPTER_VERSION,
+            "tau2_commit": tau2_commit,
+            "main_image": self.main_image,
+            "runtime_image": self.runtime_image,
+            "task_count": len(task_payload_sha256),
+            "task_payload_sha256": task_payload_sha256,
+        }
+        manifest_path = self.output_dir / "tau3-adapter-manifest.json"
+        temporary_path = self.output_dir / ".tau3-adapter-manifest.json.tmp"
+        temporary_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        temporary_path.replace(manifest_path)
+
     def run(self) -> None:
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        tau2_commit = self._resolve_tau2_commit()
         tasks = self._load_tau_tasks()
         tasks = self._filter_tasks(tasks)
         if self.limit is not None:
             tasks = tasks[: max(0, self.limit)]
 
+        self._prepare_output_dir()
+
+        task_payload_sha256: dict[str, str] = {}
         for task in tasks:
-            self._write_task(task)
+            test_config = self._build_test_config(task)
+            encoded = json.dumps(
+                test_config,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+            task_payload_sha256[task.local_task_id] = hashlib.sha256(
+                encoded
+            ).hexdigest()
+            self._write_task(task, test_config)
+
+        self._write_manifest(tau2_commit, task_payload_sha256)

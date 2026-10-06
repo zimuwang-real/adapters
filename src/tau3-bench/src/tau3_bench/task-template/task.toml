@@ -1,5 +1,10 @@
 schema_version = "1.1"
 
+[[artifacts]]
+source = "/tmp/tau3-evaluation.json"
+destination = "runtime/tau3-evaluation.json"
+service = "tau3-runtime"
+
 [task]
 name = "sierra-research/tau3-bench__{task_id}"
 authors = [
@@ -17,12 +22,25 @@ category = "customer_service"
 
 [verifier]
 timeout_sec = 300.0
-env = { OPENAI_API_KEY = "${OPENAI_API_KEY}", OPENAI_BASE_URL = "${OPENAI_BASE_URL}", TAU2_NL_ASSERTIONS_MODEL = "${TAU2_NL_ASSERTIONS_MODEL:-gpt-5.2}" }
+environment_mode = "separate"
+
+[verifier.environment]
+docker_image = "{main_image}"
+workdir = "/tests"
+cpus = 1
+memory_mb = 512
+storage_mb = 1024
+
+[[verifier.collect]]
+service = "tau3-runtime"
+command = "python3 /app/server.py --export-evaluation /tmp/tau3-evaluation.json"
+timeout_sec = 300.0
 
 [agent]
 timeout_sec = 3600.0
 
 [environment]
+docker_image = "{main_image}"
 build_timeout_sec = 600.0
 cpus = 4
 memory_mb = 8192
