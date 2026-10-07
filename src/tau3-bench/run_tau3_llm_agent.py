@@ -661,11 +661,15 @@ async def _call_tool(
     *,
     timeout_sec: float,
 ) -> Any:
-    return await session.call_tool(
+    result = await session.call_tool(
         name,
         arguments,
         read_timeout_seconds=timedelta(seconds=timeout_sec),
     )
+    if _read_value(result, "isError"):
+        error_text = call_tool_result_to_text(result)
+        raise RuntimeError(f"MCP tool {name!r} failed: {error_text}")
+    return result
 
 
 def _extract_cached_tokens(usage: Any) -> int:
