@@ -23,20 +23,25 @@ def shell_arguments() -> list[str]:
     return shlex.split(command.replace("\\\n", ""))[2:]
 
 
-def test_generated_shell_command_matches_verifier_cli(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    "status,reward", [("passed", 1.0), ("mismatch", 0.0), ("not_terminated", 0.0)]
+)
+def test_generated_shell_command_matches_verifier_cli(
+    monkeypatch, tmp_path, status, reward
+):
     """Execute the actual shell command's argument shape, not a copied CLI list."""
     evaluation = tmp_path / "runtime-result.json"
-    result = {"status": "passed", "reward": 1.0, "reward_basis": []}
+    result = {"status": status, "reward": reward, "reward_basis": []}
     evaluation.write_text(json.dumps(result))
     args = [
-        value.replace("${LOG_DIR}", str(tmp_path)).replace(
+        value.replace("/logs/verifier", str(tmp_path)).replace(
             "/tmp/tau3-evaluation.json", str(evaluation)
         )
         for value in shell_arguments()
     ]
     monkeypatch.setattr(sys, "argv", [str(EVALUATE), *args])
     module.main()
-    assert (tmp_path / "reward.txt").read_text() == "1.0"
+    assert (tmp_path / "reward.txt").read_text() == str(reward)
     assert json.loads((tmp_path / "result.json").read_text()) == result
 
 

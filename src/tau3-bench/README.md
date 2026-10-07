@@ -80,6 +80,7 @@ src/tau3-bench/
 ├── README.md
 ├── adapter_metadata.json
 ├── parity_experiment.json
+├── historical_harbor_only_results.json
 ├── metric.py
 ├── pyproject.toml
 ├── run_tau3-bench.yaml
@@ -244,9 +245,11 @@ runtime or verifier path.
 ## Comparison with Original Benchmark (Parity)
 
 The tables below preserve the **April 23, 2026 historical results**, recorded in
-`parity_experiment.json`, from before the authoritative-runtime changes. No fresh
-model parity experiment was run for this migration. Local generation and
-verifier tests do not establish parity for the new runtime.
+[`parity_experiment.json`](parity_experiment.json), from before the
+authoritative-runtime changes. This file contains only the paired experiment:
+three original runs and three Harbor runs. No fresh model parity experiment was
+run for this migration. Local generation and verifier tests do not establish
+parity for the new runtime.
 
 | Agent | Model | Metric | Number of Runs | Dataset Size | Original Benchmark Performance | Harbor Adapter Performance |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -286,13 +289,99 @@ Harbor average reward by trial:
 | 2 | 74.00% | 82.46% | 84.21% | 21.65% | 66.13% |
 | SEM | 3.06% | 2.34% | 0.77% | 1.91% | 1.03% |
 
+### Reproduction commands (prospective; not run for this migration)
+
+These commands describe a new comparison using the current adapter; they do not
+recreate or validate the historical scores above. Coordinate any model-based runs
+with the Harbor team first, as described in the [human guide](../../docs/adapters-human.mdx#4-plan-parity--implement-agents),
+including scope, funding, model versions, and provider credentials. Follow the
+[parity ramp-up order](../../docs/adapters.mdx#checklist-before-any-parity-run):
+5–10 matching tasks on both sides, one full run on both sides, then three runs on
+both sides. The commands below are for that final three-run stage.
+
+First complete [task generation](#usage-create-task-directories), including the
+pinned source checkout, images, and all 375 generated tasks. Keep the source and
+Harbor environments separate because their declared LiteLLM constraints differ.
+From the pinned tau2-bench checkout, after installing its `knowledge` extra, run
+this Bash loop. Choose a new `--save-to` prefix for each experiment so results
+from different configurations are not resumed together.
+
+```bash
+cd "$TAU2_BENCH_ROOT"
+for domain in airline retail telecom banking_knowledge; do
+  retrieval_args=()
+  if [ "$domain" = banking_knowledge ]; then
+    retrieval_args=(--retrieval-config bm25)
+  fi
+  uv run --extra knowledge tau2 run \
+    --domain "$domain" \
+    --task-split-name base \
+    --agent-llm gpt-5.2 \
+    --agent-llm-args '{"temperature":0.0,"reasoning_effort":"medium"}' \
+    --user-llm gpt-5.2 \
+    --user-llm-args '{"reasoning_effort":"low"}' \
+    --num-trials 3 --seed 300 --max-steps 200 --max-errors 10 \
+    --max-concurrency 15 \
+    --save-to "tau3-reproduction-${domain}" \
+    "${retrieval_args[@]}"
+done
+```
+
+Then return to the adapters repository root and run the Harbor side. Its config
+selects the same three trial indices, base seed, turn limits, agent model, and
+agent reasoning effort. Set the simulator options explicitly. The pinned
+upstream evaluator defaults to `gpt-4.1-2025-04-14` for natural-language assertions;
+set Harbor to that same judge for this prospective comparison, rather than its
+runtime default of `gpt-5.2`.
+
+```bash
+TAU2_USER_MODEL=gpt-5.2 \
+TAU2_USER_REASONING_EFFORT=low \
+TAU2_NL_ASSERTIONS_MODEL=gpt-4.1-2025-04-14 \
+PYTHONPATH="$PWD/src/tau3-bench" \
+uv run --project src/tau3-bench harbor run -c src/tau3-bench/run_tau3-bench.yaml
+```
+
+Both sides need the approved provider configuration, including `OPENAI_API_KEY`
+and a matching endpoint if `OPENAI_BASE_URL` is used. The `gpt-5.2` alias above
+matches the recorded historical configuration, but the history does not identify
+a dated snapshot or every provider setting. Before a new comparison, agree on
+and record the exact model versions and use them consistently in the original
+command, Harbor YAML, and simulator settings. Likewise, record the common judge,
+source commit, image IDs, and package versions. These examples do not establish
+what judge or endpoint was used for the April results.
+
+After both sides finish without infrastructure errors, compute the comparison
+with the existing metric script. Set `HARBOR_JOB_DIR` to the job directory printed
+by Harbor, then run from the adapters repository root:
+
+```bash
+python src/tau3-bench/metric.py "$HARBOR_JOB_DIR" \
+  --original-results \
+  "$TAU2_BENCH_ROOT/data/simulations/tau3-reproduction-airline/results.json" \
+  "$TAU2_BENCH_ROOT/data/simulations/tau3-reproduction-retail/results.json" \
+  "$TAU2_BENCH_ROOT/data/simulations/tau3-reproduction-telecom/results.json" \
+  "$TAU2_BENCH_ROOT/data/simulations/tau3-reproduction-banking_knowledge/results.json"
+```
+
+The script computes pass^k and per-trial average reward with sample SEM. Retain
+new raw results separately; do not overwrite the April historical evidence with
+unrun examples or local mock results.
+
 ## Standard CLI Agent Validation
 
 The historical parity run above used the adapter-local `tau3-llm-agent` to mirror
 the original tau2 interaction loop. A separate April 23, 2026 Harbor-only Codex
 run scored 63.73%, as shown below. This single run was a generalization check;
-it had no original-benchmark equivalent and predates the runtime changes.
-The corresponding command from the adapters repository root is:
+it had no original-benchmark equivalent and predates the runtime changes. Its
+original metadata record is preserved unchanged in
+[`historical_harbor_only_results.json`](historical_harbor_only_results.json),
+including `original: null`, `original_runs: []`, and the one Harbor score. It is
+kept outside `parity_experiment.json` because that schema defines
+`number_of_runs` as equal runs **per side**; this supplemental result cannot
+establish paired parity. No original run has been inferred or added.
+The corresponding command from the adapters repository root is prospective and
+was not run for this migration:
 
 ```bash
 uv run --project src/tau3-bench harbor run -p datasets/tau3-bench -a codex -m gpt-5.2
@@ -301,26 +390,6 @@ Codex results:
 | airline | retail | telecom | banking_knowledge | total |
 | --- | --- | --- | --- | --- |
 | 74.00% | 71.93% | 90.35% | 17.53% | 63.73% |
-
-## Reproduction notes:
-
-- **Original Side**: Follow the setup steps in the official benchmark repo at the
-  pinned commit: <https://github.com/sierra-research/tau2-bench>. Run the following
-  command for each domain, adding `--retrieval-config bm25` for
-  `banking_knowledge`:
-
-```bash
-tau2 run --domain "$DOMAIN" \
-         --agent-llm gpt-5.2 \
-         --agent-llm-args '{"reasoning_effort":"medium"}' \
-         --user-llm gpt-5.2 \
-         --user-llm-args '{"reasoning_effort":"low"}' \
-         --num-trials 3 \
-         --max-concurrency 15
-```
-
-- **Harbor Side**: the Harbor adapter-side parity run uses `src/tau3-bench/run_tau3-bench.yaml`. `OPENAI_API_KEY` is required for the parity agent, simulated user, and natural-language assertion evaluator when those components use OpenAI models. `OPENAI_BASE_URL`, `TAU2_USER_MODEL`, `TAU2_USER_REASONING_EFFORT`, and `TAU2_NL_ASSERTIONS_MODEL` can be set to reproduce a specific endpoint/model configuration.
-- All of the above result data were calculated using `src/tau3-bench/metric.py`.
 
 ## Installation / Prerequisites
 
